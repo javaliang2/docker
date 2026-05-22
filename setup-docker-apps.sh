@@ -8,6 +8,7 @@
 #    sudo bash setup-docker-apps.sh deploy wordpress
 #    sudo bash setup-docker-apps.sh upgrade all
 #    sudo bash setup-docker-apps.sh upgrade wordpress
+#    sudo bash setup-docker-apps.sh clone wordpress wordpress2 8084
 #    sudo bash setup-docker-apps.sh status     # 查看所有容器状态
 #
 #  新增应用只需：
@@ -647,6 +648,91 @@ print_summary() {
 }
 
 # ================================================================
+# clone_app  —  从已部署的应用复制出一个新实例
+#   $1  源 key（如 wordpress）
+#   $2  新 key（如 wordpress2）
+#   $3  新端口（如 8084）
+# ================================================================
+clone_app() {
+  local SRC_KEY="${1:-}"
+  local DST_KEY="${2:-}"
+  local NEW_PORT="${3:-}"
+
+  # ── 参数校验 ──────────────────────────────────────────────────
+  [[ -z "$SRC_KEY" || -z "$DST_KEY" || -z "$NEW_PORT" ]] && \
+    error "用法: $0 clone <源key> <新key> <新端口>\n       例如: $0 clone wordpress wordpress2 8084"
+
+  local SRC_DIR="$BASE_DIR/$SRC_KEY"
+  local DST_DIR="$BASE_DIR/$DST_KEY"
+
+  already_deployed "$SRC_KEY" || error "源应用 [$SRC_KEY] 尚未部署，请先部署后再克隆"
+  [[ -d "$DST_DIR" ]] && error "目标目录 $DST_DIR 已存在，请换一个新 key 或手动删除"
+
+  # 检查端口是否已被占用（ss 或 netstat）
+  if ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT} " || \
+     grep -r "127.0.0.1:${NEW_PORT}:" "$BASE_DIR"/*/docker-compose.yml 2>/dev/null | grep -q .; then
+    error "端口 $NEW_PORT 已被占用，请换一个端口"
+  fi
+
+  header "克隆 $SRC_KEY → $DST_KEY (端口 $NEW_PORT)"
+
+  # ── 复制目录（排除运行时数据，只复制配置）──────────────────
+  info "复制配置文件..."
+  cp -r "$SRC_DIR" "$DST_DIR"
+
+  # 删掉源实例的运行时数据（数据库、应用数据），新实例应全新初始化
+  # 保留: docker-compose.yml / conf/ / nginx.conf 等配置文件
+  for runtime_dir in db data redis config apps; do
+    [[ -d "$DST_DIR/$runtime_dir" ]] && rm -rf "${DST_DIR:?}/$runtime_dir" && mkdir -p "$DST_DIR/$runtime_dir"
+  done
+
+  # ── 替换端口 ──────────────────────────────────────────────────
+  # 找出源目录 compose 里绑定的宿主机端口（取第一个 127.0.0.1:XXXX）
+  local OLD_PORT
+  OLD_PORT=$(grep -oP '127\.0\.0\.1:\K[0-9]+(?=:)' "$DST_DIR/docker-compose.yml" | head -1)
+
+  if [[ -n "$OLD_PORT" ]]; then
+    sed -i "s/127\.0\.0\.1:${OLD_PORT}:/127.0.0.1:${NEW_PORT}:/g" "$DST_DIR/docker-compose.yml"
+    info "端口: $OLD_PORT → $NEW_PORT"
+  else
+    warn "未能自动替换端口，请手动检查 $DST_DIR/docker-compose.yml"
+  fi
+
+  # ── 替换 Docker 网络名（避免与源实例冲突）──────────────────
+  # 将所有形如 xxx_net 的网络名加上 _<DST_KEY> 后缀
+  sed -i -E "s/([a-z]+_net)\b/\1_${DST_KEY}/g" "$DST_DIR/docker-compose.yml"
+  info "网络名已隔离（加后缀 _${DST_KEY}）"
+
+  # ── 重新生成 .env 密码（避免两个实例共用相同密码）─────────
+  if [[ -f "$DST_DIR/.env" ]]; then
+    info "重新生成 .env 密码..."
+    local tmp_env="$DST_DIR/.env.new"
+    # 对所有含 PASSWORD / SECRET / TOKEN 的行重新生成随机值
+    while IFS= read -r line; do
+      if echo "$line" | grep -qiE '(PASSWORD|SECRET|TOKEN)=.+'; then
+        local key_name val_prefix
+        key_name=$(echo "$line" | cut -d= -f1)
+        echo "${key_name}=$(randpw 24)"
+      else
+        echo "$line"
+      fi
+    done < "$DST_DIR/.env" > "$tmp_env"
+    mv "$tmp_env" "$DST_DIR/.env"
+    info "新凭据已保存至 $DST_DIR/.env"
+  fi
+
+  # ── 启动新实例 ────────────────────────────────────────────────
+  ( cd "$DST_DIR" && docker compose up -d )
+
+  echo ""
+  log "克隆完成！"
+  log "新实例目录: $DST_DIR"
+  log "访问地址:   http://127.0.0.1:$NEW_PORT"
+  log "凭据文件:   $DST_DIR/.env"
+  info "提示：此实例数据库全新初始化，与源实例 [$SRC_KEY] 数据完全隔离"
+}
+
+# ================================================================
 # 交互式菜单
 # ================================================================
 interactive_menu() {
@@ -661,9 +747,10 @@ interactive_menu() {
     echo -e "║  4) 升级应用（选择）                                        ║"
     echo -e "║  5) 升级全部已部署应用                                      ║"
     echo -e "║  6) 查看运行状态                                            ║"
+    echo -e "║  7) 克隆应用（同一应用部署多实例）                          ║"
     echo -e "║  0) 退出                                                    ║"
     echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo -n "  请选择 [0-6]: "
+    echo -n "  请选择 [0-7]: "
     read -r choice
 
     case $choice in
@@ -734,6 +821,38 @@ interactive_menu() {
 
       6) show_status ;;
 
+      7)
+        echo ""
+        echo -e "${BOLD}已部署应用（可作为克隆源）：${NC}"
+        local i=1
+        declare -a deployed_keys=()
+        for entry in "${APP_LIST[@]}"; do
+          local key name port
+          key=$(app_key "$entry"); name=$(app_name "$entry"); port=$(app_port "$entry")
+          if already_deployed "$key"; then
+            printf "  %2d) %-18s :%-6s\n" $i "$name" "$port"
+            deployed_keys+=("$key")
+            ((i++))
+          fi
+        done
+        if [[ ${#deployed_keys[@]} -eq 0 ]]; then
+          warn "暂无已部署的应用"
+        else
+          echo -n "  选择源应用编号: "
+          read -r sel
+          if [[ $sel =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#deployed_keys[@]} )); then
+            local src_key="${deployed_keys[$((sel-1))]}"
+            echo -n "  新实例名称（如 ${src_key}2）: "
+            read -r dst_key
+            echo -n "  新实例端口（如 8090）: "
+            read -r new_port
+            clone_app "$src_key" "$dst_key" "$new_port"
+          else
+            warn "无效编号"
+          fi
+        fi
+        ;;
+
       0) echo "退出"; exit 0 ;;
 
       *) warn "无效选项，请重新输入" ;;
@@ -764,6 +883,9 @@ case "$CMD" in
     ;;
   status)
     show_status
+    ;;
+  clone)
+    clone_app "${2:-}" "${3:-}" "${4:-}"
     ;;
   menu|*)
     interactive_menu
