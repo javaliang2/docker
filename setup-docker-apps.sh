@@ -1,193 +1,241 @@
 #!/bin/bash
-# ================================================================
-#  Docker + Docker Compose  安装 / 应用部署 / 升级 管理脚本
-#
-#  用法:
-#    sudo bash setup-docker-apps.sh            # 交互式菜单
-#    sudo bash setup-docker-apps.sh deploy all # 部署全部应用
-#    sudo bash setup-docker-apps.sh deploy wordpress
-#    sudo bash setup-docker-apps.sh upgrade all
-#    sudo bash setup-docker-apps.sh upgrade wordpress
-#    sudo bash setup-docker-apps.sh clone wordpress wordpress2 8084
-#    sudo bash setup-docker-apps.sh status     # 查看所有容器状态
-#
-#  新增应用只需：
-#    1. 在 APP_LIST 数组中加一行  "key|名称|端口"
-#    2. 实现对应的  deploy_<key>()  函数
-#  ——其他所有菜单、升级、状态逻辑自动生效
-# ================================================================
+# ============================================================
+#  Docker + Docker Compose 安装 & 热门应用一键部署脚本
+#  支持：WordPress / Nextcloud / Gitea / Uptime Kuma /
+#        Portainer / phpMyAdmin / Redis Commander /
+#        MinIO / Lsky Pro / EasyImage / Nginx Proxy Manager /
+#        Vaultwarden / N8N
+#  用法：sudo bash setup-docker-apps.sh [选项]
+# ============================================================
+
 set -euo pipefail
 
-# ── 颜色 ─────────────────────────────────────────────────────────
-RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+# ── 颜色 ────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 log()    { echo -e "${GREEN}[✔]${NC} $*"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $*"; }
 error()  { echo -e "${RED}[✘]${NC} $*"; exit 1; }
-info()   { echo -e "${BLUE}[i]${NC} $*"; }
-header() { echo -e "\n${CYAN}${BOLD}━━━  $*  ━━━${NC}\n"; }
-hr()     { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
+header() { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}\n"; }
 
-# ── 基础目录 ──────────────────────────────────────────────────────
+# ── 基础目录 ─────────────────────────────────────────────────
 BASE_DIR="/opt/docker-apps"
 mkdir -p "$BASE_DIR"
 
+# ── 检查 root ────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行此脚本"
 
-# ================================================================
-# ★  应用注册表
-#    格式:  "key|显示名称|本地访问端口|简介"
-#    新增应用: 在这里加一行 + 实现 deploy_<key>() 函数即可
-# ================================================================
-declare -a APP_LIST=(
-  "wordpress   | WordPress          | 8080 | 博客/CMS，含 MariaDB + Redis"
-  "nextcloud   | Nextcloud          | 8081 | 私有云盘，含 MariaDB + Redis"
-  "gitea       | Gitea              | 3000 | 轻量 Git 服务，含 PostgreSQL"
-  "alist       | AList              | 5244 | 多存储聚合网盘"
-  "uptime_kuma | Uptime Kuma        | 3001 | 服务监控面板"
-  "portainer   | Portainer CE       | 9000 | Docker 可视化管理"
-  "phpmyadmin  | phpMyAdmin         | 8082 | MySQL/MariaDB Web 管理"
-  "redis_cmd   | Redis Commander    | 8083 | Redis Web GUI"
-)
+# ── 显示帮助 ─────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+用法: $0 [选项]
+选项:
+  无参数              安装 Docker 并部署所有应用
+  --install           仅安装 Docker
+  --deploy APP        仅部署指定应用
+  --uninstall APP     卸载指定应用并删除数据
+  --backup APP        备份指定应用到 /tmp
+  --list              列出所有可管理的应用
+  --help              显示此帮助
 
-# 解析注册表 helper
-app_key()  { echo "$1" | awk -F'|' '{gsub(/ /,"",$1); print $1}'; }
-app_name() { echo "$1" | awk -F'|' '{gsub(/^ +| +$/,"",$2); print $2}'; }
-app_port() { echo "$1" | awk -F'|' '{gsub(/ /,"",$3); print $3}'; }
-app_desc() { echo "$1" | awk -F'|' '{gsub(/^ +| +$/,"",$4); print $4}'; }
+可部署的应用:
+  wordpress, nextcloud, gitea, uptime-kuma, portainer
+  phpmyadmin, redis-commander, minio, lskypro
+  easyimage, nginxpm, vaultwarden, n8n
 
-# ================================================================
-# 工具函数
-# ================================================================
-randpw() { tr -dc 'A-Za-z0-9@#%^&*' </dev/urandom | head -c "${1:-20}"; }
-
-# 跳过已部署的应用（docker-compose.yml 存在则视为已部署）
-already_deployed() {
-  local key=$1
-  [[ -f "$BASE_DIR/$key/docker-compose.yml" ]]
+示例:
+  sudo bash $0                        # 完整安装
+  sudo bash $0 --deploy wordpress     # 仅部署 WordPress
+  sudo bash $0 --uninstall gitea      # 卸载 Gitea
+  sudo bash $0 --backup nextcloud     # 备份 Nextcloud
+  sudo bash $0 --list                 # 查看应用状态
+EOF
+    exit 0
 }
 
-# ================================================================
-# 1. 安装 / 更新 Docker
-# ================================================================
-install_docker() {
-  header "安装 / 更新 Docker Engine"
-
-  if command -v docker &>/dev/null; then
-    CURRENT=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
-    warn "已检测到 Docker $CURRENT，执行更新..."
-  fi
-
-  apt-get update -qq
-  apt-get install -y -qq ca-certificates curl gnupg lsb-release
-
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg" \
-    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") \
-    $(lsb_release -cs) stable" \
-    > /etc/apt/sources.list.d/docker.list
-
-  apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin
-
-  systemctl enable --now docker
-
-  log "Docker        $(docker version --format '{{.Server.Version}}')"
-  log "Compose       $(docker compose version --short)"
-}
-
-# ================================================================
-# 2. 升级单个应用（pull 最新镜像 → 重建容器）
-# ================================================================
-upgrade_app() {
-  local key=$1
-  local DIR="$BASE_DIR/$key"
-
-  if ! already_deployed "$key"; then
-    warn "[$key] 尚未部署，跳过升级"
-    return
-  fi
-
-  header "升级 $key"
-  (
-    cd "$DIR"
-    docker compose pull          # 拉取所有服务最新镜像
-    docker compose up -d --remove-orphans   # 重建有变更的容器
-    docker image prune -f        # 清理旧镜像
-  )
-  log "$key 升级完成"
-}
-
-# 升级全部已部署的应用
-upgrade_all() {
-  header "升级所有已部署应用"
-  for entry in "${APP_LIST[@]}"; do
-    local key; key=$(app_key "$entry")
-    upgrade_app "$key"
-  done
-  log "全部升级完成"
-}
-
-# ================================================================
-# 3. 状态总览
-# ================================================================
-show_status() {
-  header "应用运行状态"
-  printf "%-16s %-20s %-8s %s\n" "KEY" "NAME" "PORT" "STATUS"
-  hr
-  for entry in "${APP_LIST[@]}"; do
-    local key name port status
-    key=$(app_key "$entry"); name=$(app_name "$entry"); port=$(app_port "$entry")
-    if already_deployed "$key"; then
-      # 检查是否有容器在跑
-      running=$(docker compose -f "$BASE_DIR/$key/docker-compose.yml" ps --status running -q 2>/dev/null | wc -l)
-      if [[ $running -gt 0 ]]; then
-        status="${GREEN}running($running)${NC}"
-      else
-        status="${YELLOW}stopped${NC}"
-      fi
-    else
-      status="${DIM}not deployed${NC}"
+# ── 列出应用 ─────────────────────────────────────────────────
+list_apps() {
+    echo -e "${CYAN}可管理的应用:${NC}"
+    echo "  wordpress, nextcloud, gitea, uptime-kuma, portainer"
+    echo "  phpmyadmin, redis-commander, minio, lskypro"
+    echo "  easyimage, nginxpm, vaultwarden, n8n"
+    echo -e "\n${CYAN}已部署的应用:${NC}"
+    if [ -d "$BASE_DIR" ]; then
+        for dir in "$BASE_DIR"/*/; do
+            app=$(basename "$dir")
+            if [ -f "$dir/docker-compose.yml" ]; then
+                status=$(cd "$dir" && docker compose ps --format '{{.Status}}' 2>/dev/null | head -1 || echo "stopped")
+                echo -e "  ${GREEN}$app${NC} - $status"
+            fi
+        done
     fi
-    printf "%-16s %-20s %-8s " "$key" "$name" ":$port"
-    echo -e "$status"
-  done
-  hr
+    exit 0
 }
 
-# ================================================================
-# ── 以下每个 deploy_* 函数对应一个应用 ──
-# ================================================================
+# ── 系统检查 ─────────────────────────────────────────────────
+check_system() {
+    local mem=$(free -m | awk '/^Mem:/{print $2}')
+    local disk=$(df -m /opt | awk 'NR==2{print $4}')
+    
+    [ "$mem" -lt 1024 ] && warn "内存不足 1GB（当前 ${mem}MB），可能影响性能"
+    [ "$disk" -lt 5120 ] && warn "磁盘空间不足 5GB（剩余 ${disk}MB），建议扩展空间"
+    
+    # 检测发行版
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian) return 0 ;;
+            *) error "仅支持 Ubuntu/Debian 系统，当前系统: $ID" ;;
+        esac
+    else
+        error "无法检测系统发行版"
+    fi
+}
 
-# ── WordPress（MariaDB + Redis + nginx-fpm sidecar）─────────────
+# ── Docker Compose 启动包装 ─────────────────────────────────
+run_compose() {
+    local dir="$1"
+    local name="$2"
+    cd "$dir"
+    if docker compose up -d; then
+        log "$name 启动成功"
+    else
+        error "无法启动 $name，请检查 $dir 目录"
+    fi
+    cd - > /dev/null
+}
+
+# ============================================================
+# 1. 安装 / 更新 Docker
+# ============================================================
+install_docker() {
+    header "安装 / 更新 Docker Engine"
+
+    if command -v docker &>/dev/null; then
+        CURRENT=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
+        warn "检测到已安装 Docker（版本 $CURRENT），执行更新..."
+    fi
+
+    # 检测发行版
+    . /etc/os-release
+
+    # 依赖
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg lsb-release
+
+    # GPG 密钥
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # 源
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/${ID} $(lsb_release -cs) stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin
+
+    systemctl enable --now docker
+
+    DOCKER_VER=$(docker version --format '{{.Server.Version}}')
+    COMPOSE_VER=$(docker compose version --short)
+    log "Docker        $DOCKER_VER"
+    log "Docker Compose $COMPOSE_VER"
+
+    # 防火墙提示
+    if command -v ufw &>/dev/null && ufw status | grep -q inactive; then
+        warn "检测到 ufw 未启用，建议执行: ufw enable && ufw allow 22/tcp"
+    fi
+}
+
+# ============================================================
+# 2. 生成随机密码工具
+# ============================================================
+randpw() { 
+    tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c "${1:-24}" 
+}
+
+# ============================================================
+# 3. 备份应用
+# ============================================================
+backup_app() {
+    local app="$1"
+    local dir="$BASE_DIR/$app"
+    local backup_file="/tmp/${app}_$(date +%Y%m%d_%H%M%S).tar.gz"
+    
+    if [ ! -d "$dir" ]; then
+        error "应用 $app 未部署，目录 $dir 不存在"
+    fi
+    
+    header "备份 $app"
+    
+    # 先停止服务以确保数据一致性
+    (cd "$dir" && docker compose stop) 2>/dev/null || true
+    
+    # 备份
+    tar -czf "$backup_file" -C "$(dirname "$dir")" "$(basename "$dir")"
+    
+    # 重启服务
+    (cd "$dir" && docker compose start) 2>/dev/null || true
+    
+    local size=$(du -h "$backup_file" | cut -f1)
+    log "已备份 $app 到 $backup_file (大小: $size)"
+}
+
+# ============================================================
+# 4. 卸载应用
+# ============================================================
+uninstall_app() {
+    local app="$1"
+    local dir="$BASE_DIR/$app"
+    
+    if [ ! -d "$dir" ]; then
+        error "应用 $app 未部署，目录 $dir 不存在"
+    fi
+    
+    header "卸载 $app"
+    
+    if [ -f "$dir/docker-compose.yml" ]; then
+        (cd "$dir" && docker compose down -v --remove-orphans) || warn "容器停止失败，继续清理..."
+    fi
+    
+    # 备份凭据文件（如果存在）
+    if [ -f "$dir/.env" ]; then
+        cp "$dir/.env" "/tmp/${app}_env_backup_$(date +%Y%m%d)" 2>/dev/null || true
+        log "凭据已备份到 /tmp/${app}_env_backup_$(date +%Y%m%d)"
+    fi
+    
+    rm -rf "$dir"
+    log "已卸载 $app 并删除所有数据"
+}
+
+# ============================================================
+# 5. WordPress（含 MariaDB + Redis 缓存）
+# ============================================================
 deploy_wordpress() {
-  local DIR="$BASE_DIR/wordpress"
-  mkdir -p "$DIR"/{data,db,redis,conf}
+    header "部署 WordPress"
+    local DIR="$BASE_DIR/wordpress"
+    mkdir -p "$DIR"/{data,db,redis,uploads}
 
-  local DB_ROOT_PW; DB_ROOT_PW=$(randpw 24)
-  local DB_PW;      DB_PW=$(randpw 24)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
 
-  cat > "$DIR/.env" <<EOF
+    cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_ROOT_PASSWORD=$DB_ROOT_PW
 WORDPRESS_DB_PASSWORD=$DB_PW
 WORDPRESS_DB_NAME=wordpress
 WORDPRESS_DB_USER=wpuser
 EOF
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   db:
     image: mariadb:11
     restart: unless-stopped
-    env_file: .env
     environment:
       MARIADB_ROOT_PASSWORD: ${WORDPRESS_DB_ROOT_PASSWORD}
       MARIADB_DATABASE: ${WORDPRESS_DB_NAME}
@@ -216,7 +264,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
     environment:
       WORDPRESS_DB_HOST: db:3306
       WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME}
@@ -230,7 +277,7 @@ services:
         define('WP_MAX_MEMORY_LIMIT', '1024M');
     volumes:
       - ./data:/var/www/html
-      - ./conf/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - ./uploads/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
     networks: [wp_net]
 
   nginx:
@@ -239,7 +286,7 @@ services:
     depends_on: [wordpress]
     volumes:
       - ./data:/var/www/html:ro
-      - ./conf/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./uploads/nginx-wp.conf:/etc/nginx/conf.d/default.conf:ro
     networks: [wp_net]
     ports:
       - "127.0.0.1:8080:80"
@@ -249,7 +296,8 @@ networks:
     driver: bridge
 YAML
 
-  cat > "$DIR/conf/php-uploads.ini" <<'INI'
+    # PHP 上传限制
+    cat > "$DIR/uploads/php-uploads.ini" <<'INI'
 upload_max_filesize = 2048M
 post_max_size       = 2048M
 memory_limit        = 1024M
@@ -258,13 +306,17 @@ max_input_time      = 600
 max_input_vars      = 10000
 INI
 
-  cat > "$DIR/conf/nginx.conf" <<'NGINX'
+    # nginx → php-fpm 配置
+    cat > "$DIR/uploads/nginx-wp.conf" <<'NGINX'
 server {
     listen 80;
     root /var/www/html;
     index index.php index.html;
     client_max_body_size 2048M;
-    location / { try_files $uri $uri/ /index.php?$args; }
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
     location ~ \.php$ {
         fastcgi_pass  wordpress:9000;
         fastcgi_index index.php;
@@ -273,37 +325,40 @@ server {
         fastcgi_read_timeout 600;
     }
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2)$ {
-        expires max; log_not_found off;
+        expires max;
+        log_not_found off;
     }
 }
 NGINX
 
-  ( cd "$DIR" && docker compose up -d )
-  log "WordPress → http://127.0.0.1:8080   凭据: $DIR/.env"
+    run_compose "$DIR" "WordPress"
+    log "WordPress 已启动 → http://127.0.0.1:8080  （在外部 nginx 反代此端口）"
+    log "凭据已保存至 $DIR/.env"
 }
 
-# ── Nextcloud（MariaDB + Redis + cron + nginx-fpm sidecar）──────
+# ============================================================
+# 6. Nextcloud（含 MariaDB + Redis）
+# ============================================================
 deploy_nextcloud() {
-  local DIR="$BASE_DIR/nextcloud"
-  mkdir -p "$DIR"/{data,db,config,apps,conf}
+    header "部署 Nextcloud"
+    local DIR="$BASE_DIR/nextcloud"
+    mkdir -p "$DIR"/{data,db,redis,config,apps}
 
-  local DB_ROOT_PW; DB_ROOT_PW=$(randpw 24)
-  local DB_PW;      DB_PW=$(randpw 24)
-  local ADMIN_PW;   ADMIN_PW=$(randpw 20)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
+    local ADMIN_PW=$(randpw 20)
 
-  cat > "$DIR/.env" <<EOF
+    cat > "$DIR/.env" <<EOF
 MYSQL_ROOT_PASSWORD=$DB_ROOT_PW
 MYSQL_PASSWORD=$DB_PW
 NEXTCLOUD_ADMIN_PASSWORD=$ADMIN_PW
 EOF
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   db:
     image: mariadb:11
     restart: unless-stopped
-    env_file: .env
     environment:
       MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MARIADB_DATABASE: nextcloud
@@ -329,7 +384,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
     environment:
       MYSQL_HOST: db
       MYSQL_DATABASE: nextcloud
@@ -353,7 +407,7 @@ services:
     volumes:
       - ./data:/var/www/html/data:ro
       - ./config:/var/www/html/config:ro
-      - ./conf/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     networks: [nc_net]
     ports:
       - "127.0.0.1:8081:80"
@@ -362,10 +416,10 @@ services:
     image: nextcloud:production-fpm-alpine
     restart: unless-stopped
     depends_on: [nextcloud]
-    entrypoint: /cron.sh
     volumes:
       - ./data:/var/www/html/data
       - ./config:/var/www/html/config
+    entrypoint: /cron.sh
     networks: [nc_net]
 
 networks:
@@ -373,16 +427,23 @@ networks:
     driver: bridge
 YAML
 
-  cat > "$DIR/conf/nginx.conf" <<'NGINX'
+    cat > "$DIR/nginx.conf" <<'NGINX'
 upstream php-handler { server nextcloud:9000; }
 server {
     listen 80;
     root /var/www/html;
     client_max_body_size 2048M;
+    add_header Strict-Transport-Security "max-age=15768000" always;
+
     location = /robots.txt { allow all; log_not_found off; access_log off; }
     location ^~ /.well-known { return 301 /index.php$uri; }
-    location / { rewrite ^ /index.php; }
+
+    location / {
+        rewrite ^ /index.php;
+    }
     location ~ ^\/(?:build|tests|config|lib|3rdparty|templates|data)\/ { deny all; }
+    location ~ ^\/(?:\.|autotest|occ|issue|indie|db_|console) { deny all; }
+
     location ~ ^\/(?:index|remote|public|cron|core\/ajax\/update|status|ocs\/v[12]|updater\/.+|oc[ms]-provider\/.+)\.php(?:$|\/) {
         fastcgi_split_path_info ^(.+?\.php)(\/.*|)$;
         fastcgi_pass php-handler;
@@ -392,32 +453,45 @@ server {
         fastcgi_param PATH_INFO $fastcgi_path_info;
         fastcgi_read_timeout 600;
     }
-    location ~* \.(?:css|js|woff2|svg|gif|map)$ { try_files $uri /index.php$request_uri; expires 6M; }
-    location ~* \.(?:png|html|ttf|ico|jpg|jpeg)$ { try_files $uri /index.php$request_uri; }
+
+    location ~ ^\/(?:updater|oc[ms]-provider)(?:$|\/) {
+        try_files $uri/ =404;
+        index index.php;
+    }
+
+    location ~* \.(?:css|js|woff2|svg|gif|map)$ {
+        try_files $uri /index.php$request_uri;
+        expires 6M;
+    }
+    location ~* \.(?:png|html|ttf|ico|jpg|jpeg|bcmap|mp4|webm)$ {
+        try_files $uri /index.php$request_uri;
+    }
 }
 NGINX
 
-  ( cd "$DIR" && docker compose up -d )
-  log "Nextcloud → http://127.0.0.1:8081   admin / $(grep NEXTCLOUD_ADMIN_PASSWORD "$DIR/.env" | cut -d= -f2)"
+    run_compose "$DIR" "Nextcloud"
+    log "Nextcloud 已启动 → http://127.0.0.1:8081"
+    log "管理员: admin / $(grep NEXTCLOUD_ADMIN_PASSWORD "$DIR/.env" | cut -d= -f2)"
 }
 
-# ── Gitea（PostgreSQL）──────────────────────────────────────────
+# ============================================================
+# 7. Gitea（Git 服务，含 PostgreSQL）
+# ============================================================
 deploy_gitea() {
-  local DIR="$BASE_DIR/gitea"
-  mkdir -p "$DIR"/{data,db}
+    header "部署 Gitea"
+    local DIR="$BASE_DIR/gitea"
+    mkdir -p "$DIR"/{data,db}
 
-  local DB_PW; DB_PW=$(randpw 24)
-  cat > "$DIR/.env" <<EOF
+    local DB_PW=$(randpw)
+    cat > "$DIR/.env" <<EOF
 POSTGRES_PASSWORD=$DB_PW
 EOF
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
-    env_file: .env
     environment:
       POSTGRES_USER: gitea
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -437,7 +511,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
     environment:
       USER_UID: 1000
       USER_GID: 1000
@@ -449,6 +522,7 @@ services:
       GITEA__server__DOMAIN: localhost
       GITEA__server__ROOT_URL: http://localhost/
       GITEA__attachment__MAX_SIZE: 2048
+      GITEA__picture__MAX_ORIGINAL_FILE_SIZE: 4096
     volumes:
       - ./data:/data
       - /etc/timezone:/etc/timezone:ro
@@ -463,63 +537,19 @@ networks:
     driver: bridge
 YAML
 
-  ( cd "$DIR" && docker compose up -d )
-  log "Gitea → http://127.0.0.1:3000   SSH: :2222   凭据: $DIR/.env"
+    run_compose "$DIR" "Gitea"
+    log "Gitea 已启动 → http://127.0.0.1:3000  SSH: 127.0.0.1:2222"
 }
 
-# ── AList（多存储聚合网盘）──────────────────────────────────────
-# AList 支持：本地、阿里云盘、OneDrive、Google Drive、S3、WebDAV 等
-deploy_alist() {
-  local DIR="$BASE_DIR/alist"
-  mkdir -p "$DIR/data"
-
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
-services:
-  alist:
-    image: xhofe/alist:latest
-    restart: unless-stopped
-    volumes:
-      - ./data:/opt/alist/data
-    ports:
-      - "127.0.0.1:5244:5244"
-    environment:
-      PUID: 0
-      PGID: 0
-      UMASK: 022
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5244/api/auth/login"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-YAML
-
-  ( cd "$DIR" && docker compose up -d )
-
-  # 等待容器就绪后读取初始密码
-  info "等待 AList 初始化（约 5 秒）..."
-  sleep 5
-  ALIST_PW=$(docker compose -f "$DIR/docker-compose.yml" exec -T alist \
-    ./alist admin random 2>/dev/null | grep -oP '(?<=password: )\S+' || echo "请运行: docker exec alist ./alist admin random")
-
-  cat > "$DIR/.env" <<EOF
-# AList 管理密码（首次生成）
-ALIST_ADMIN_PASSWORD=$ALIST_PW
-# 如需重置: docker compose exec alist ./alist admin random
-# 如需设置固定密码: docker compose exec alist ./alist admin set <密码>
-EOF
-
-  log "AList → http://127.0.0.1:5244   admin / $ALIST_PW"
-  log "凭据已保存至 $DIR/.env"
-}
-
-# ── Uptime Kuma ─────────────────────────────────────────────────
+# ============================================================
+# 8. Uptime Kuma（监控）
+# ============================================================
 deploy_uptime_kuma() {
-  local DIR="$BASE_DIR/uptime_kuma"
-  mkdir -p "$DIR/data"
+    header "部署 Uptime Kuma"
+    local DIR="$BASE_DIR/uptime-kuma"
+    mkdir -p "$DIR/data"
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   uptime-kuma:
     image: louislam/uptime-kuma:latest
@@ -530,17 +560,19 @@ services:
       - "127.0.0.1:3001:3001"
 YAML
 
-  ( cd "$DIR" && docker compose up -d )
-  log "Uptime Kuma → http://127.0.0.1:3001"
+    run_compose "$DIR" "Uptime Kuma"
+    log "Uptime Kuma 已启动 → http://127.0.0.1:3001"
 }
 
-# ── Portainer CE ────────────────────────────────────────────────
+# ============================================================
+# 9. Portainer（Docker 管理 UI）
+# ============================================================
 deploy_portainer() {
-  local DIR="$BASE_DIR/portainer"
-  mkdir -p "$DIR/data"
+    header "部署 Portainer CE"
+    local DIR="$BASE_DIR/portainer"
+    mkdir -p "$DIR/data"
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   portainer:
     image: portainer/portainer-ce:latest
@@ -549,27 +581,30 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/data
     ports:
-      - "127.0.0.1:9000:9000"
       - "127.0.0.1:9443:9443"
+      - "127.0.0.1:9000:9000"
 YAML
 
-  ( cd "$DIR" && docker compose up -d )
-  log "Portainer → http://127.0.0.1:9000   HTTPS: https://127.0.0.1:9443"
+    run_compose "$DIR" "Portainer"
+    log "Portainer 已启动 → http://127.0.0.1:9000  HTTPS: https://127.0.0.1:9443"
 }
 
-# ── phpMyAdmin ──────────────────────────────────────────────────
+# ============================================================
+# 10. phpMyAdmin（数据库管理）
+# ============================================================
 deploy_phpmyadmin() {
-  local DIR="$BASE_DIR/phpmyadmin"
-  mkdir -p "$DIR"
+    header "部署 phpMyAdmin"
+    local DIR="$BASE_DIR/phpmyadmin"
+    mkdir -p "$DIR"
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   phpmyadmin:
     image: phpmyadmin:latest
     restart: unless-stopped
     environment:
       PMA_ARBITRARY: 1
+      PMA_ABSOLUTE_URI: "http://localhost/pma/"
       UPLOAD_LIMIT: 2048M
       MEMORY_LIMIT: 1024M
       MAX_EXECUTION_TIME: 600
@@ -577,317 +612,393 @@ services:
       - "127.0.0.1:8082:80"
 YAML
 
-  ( cd "$DIR" && docker compose up -d )
-  log "phpMyAdmin → http://127.0.0.1:8082   （可连接任意 MySQL/MariaDB 主机）"
+    run_compose "$DIR" "phpMyAdmin"
+    log "phpMyAdmin 已启动 → http://127.0.0.1:8082  （填入任意 MySQL 主机连接）"
 }
 
-# ── Redis Commander ─────────────────────────────────────────────
-deploy_redis_cmd() {
-  local DIR="$BASE_DIR/redis_cmd"
-  mkdir -p "$DIR"
+# ============================================================
+# 11. Redis Commander（Redis GUI）
+# ============================================================
+deploy_redis_commander() {
+    header "部署 Redis Commander"
+    local DIR="$BASE_DIR/redis-commander"
+    mkdir -p "$DIR"
 
-  cat > "$DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
+    cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   redis-commander:
     image: rediscommander/redis-commander:latest
     restart: unless-stopped
     environment:
       REDIS_HOSTS: "local:host.docker.internal:6379"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:8083:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 YAML
 
-  ( cd "$DIR" && docker compose up -d )
-  log "Redis Commander → http://127.0.0.1:8083"
+    run_compose "$DIR" "Redis Commander"
+    log "Redis Commander 已启动 → http://127.0.0.1:8083"
 }
 
-# ================================================================
-# 调度：根据 key 调用对应 deploy_* 函数
-# ================================================================
-do_deploy() {
-  local key=$1
+# ============================================================
+# 12. MinIO（对象存储）
+# ============================================================
+deploy_minio() {
+    header "部署 MinIO"
+    local DIR="$BASE_DIR/minio"
+    mkdir -p "$DIR/data"
 
-  if already_deployed "$key"; then
-    warn "[$key] 已存在部署目录，跳过（如需重新部署请先删除 $BASE_DIR/$key）"
-    return
-  fi
+    local ACCESS_KEY="admin"
+    local SECRET_KEY=$(randpw 32)
+    cat > "$DIR/.env" <<EOF
+MINIO_ROOT_USER=$ACCESS_KEY
+MINIO_ROOT_PASSWORD=$SECRET_KEY
+EOF
 
-  # 动态调用 deploy_<key>
-  if declare -f "deploy_$key" > /dev/null; then
-    header "部署 $key"
-    "deploy_$key"
-  else
-    error "未找到 deploy_${key}() 函数，请检查脚本"
-  fi
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:9002:9000"  # API
+      - "127.0.0.1:9001:9001"  # Console
+    networks: [minio_net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+networks:
+  minio_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "MinIO"
+    log "MinIO 已启动"
+    log "API: http://127.0.0.1:9002"
+    log "控制台: http://127.0.0.1:9001"
+    log "Access Key: $ACCESS_KEY"
+    log "Secret Key: $SECRET_KEY"
 }
 
-# ================================================================
-# 汇总打印
-# ================================================================
+# ============================================================
+# 13. Lsky Pro（兰空图床）
+# ============================================================
+deploy_lskypro() {
+    header "部署 Lsky Pro 图床"
+    local DIR="$BASE_DIR/lskypro"
+    mkdir -p "$DIR"/{data,config,mysql}
+
+    local MYSQL_ROOT_PW=$(randpw)
+    local MYSQL_PW=$(randpw)
+    cat > "$DIR/.env" <<EOF
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PW
+MYSQL_PASSWORD=$MYSQL_PW
+EOF
+
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  lskypro:
+    image: daryl11/lsky-pro:latest
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - ./data:/var/www/html
+      - ./config:/var/www/html/config
+    ports:
+      - "127.0.0.1:8085:80"
+    depends_on:
+      - lskypro-db
+    networks: [lskypro_net]
+
+  lskypro-db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: lskypro
+      MYSQL_USER: lskypro
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./mysql:/var/lib/mysql
+    networks: [lskypro_net]
+
+networks:
+  lskypro_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "Lsky Pro"
+    log "Lsky Pro 已启动 → http://127.0.0.1:8085"
+    log "数据库: lskypro / lskypro / $MYSQL_PW"
+}
+
+# ============================================================
+# 14. EasyImage（轻量图床）
+# ============================================================
+deploy_easyimage() {
+    header "部署 EasyImage 图床"
+    local DIR="$BASE_DIR/easyimage"
+    mkdir -p "$DIR"/{data,config}
+
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  easyimage:
+    image: ddsderek/easyimage:latest
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      PUID: 1000
+      PGID: 1000
+    volumes:
+      - ./data:/app/web/i
+      - ./config:/app/web/config
+    ports:
+      - "127.0.0.1:8086:80"
+    networks: [easyimage_net]
+
+networks:
+  easyimage_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "EasyImage"
+    log "EasyImage 已启动 → http://127.0.0.1:8086"
+    log "支持存储驱动: 本地/S3(MinIO)/FTP/阿里OSS等"
+}
+
+# ============================================================
+# 15. Nginx Proxy Manager（反代管理）
+# ============================================================
+deploy_nginxpm() {
+    header "部署 Nginx Proxy Manager"
+    local DIR="$BASE_DIR/nginx-proxy-manager"
+    mkdir -p "$DIR"/{data,letsencrypt}
+
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:81:81"
+    networks: [npm_net]
+
+networks:
+  npm_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "Nginx Proxy Manager"
+    log "Nginx Proxy Manager 已启动"
+    log "管理界面 → http://127.0.0.1:81"
+    log "默认账号: admin@example.com / changeme"
+}
+
+# ============================================================
+# 16. Vaultwarden（密码管理）
+# ============================================================
+deploy_vaultwarden() {
+    header "部署 Vaultwarden"
+    local DIR="$BASE_DIR/vaultwarden"
+    mkdir -p "$DIR/data"
+
+    local ADMIN_TOKEN=$(randpw 48)
+    cat > "$DIR/.env" <<EOF
+ADMIN_TOKEN=$ADMIN_TOKEN
+EOF
+
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    restart: unless-stopped
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      SIGNUPS_ALLOWED: "false"
+      WEBSOCKET_ENABLED: "true"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8087:80"
+    networks: [vw_net]
+
+networks:
+  vw_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "Vaultwarden"
+    log "Vaultwarden 已启动 → http://127.0.0.1:8087"
+    log "管理面板: http://127.0.0.1:8087/admin"
+    log "Admin Token: $ADMIN_TOKEN"
+}
+
+# ============================================================
+# 17. N8N（工作流自动化）
+# ============================================================
+deploy_n8n() {
+    header "部署 N8N"
+    local DIR="$BASE_DIR/n8n"
+    mkdir -p "$DIR/data"
+
+    local ENCRYPTION_KEY=$(randpw 32)
+    cat > "$DIR/.env" <<EOF
+N8N_ENCRYPTION_KEY=$ENCRYPTION_KEY
+EOF
+
+    cat > "$DIR/docker-compose.yml" <<'YAML'
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      NODE_ENV: production
+      WEBHOOK_URL: http://localhost/
+    volumes:
+      - ./data:/home/node/.n8n
+    ports:
+      - "127.0.0.1:5678:5678"
+    networks: [n8n_net]
+
+networks:
+  n8n_net:
+    driver: bridge
+YAML
+
+    run_compose "$DIR" "N8N"
+    log "N8N 已启动 → http://127.0.0.1:5678"
+    log "Encryption Key: $ENCRYPTION_KEY"
+}
+
+# ============================================================
+# 18. 打印汇总
+# ============================================================
 print_summary() {
-  echo ""
-  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
-  echo -e "║           🐳  部署完成 — 端口 & 凭据汇总                    ║"
-  echo -e "╠══════════════════════════════════════════════════════════════╣"
-  for entry in "${APP_LIST[@]}"; do
-    local key name port
-    key=$(app_key "$entry"); name=$(app_name "$entry"); port=$(app_port "$entry")
-    if already_deployed "$key"; then
-      printf "║  %-18s → http://127.0.0.1:%-6s                  ║\n" "$name" "$port"
-    fi
-  done
-  echo -e "╠══════════════════════════════════════════════════════════════╣"
-  echo -e "║  凭据文件: /opt/docker-apps/<app>/.env                      ║"
-  echo -e "║  升级全部: sudo bash $0 upgrade all          ║"
-  echo -e "║  升级单个: sudo bash $0 upgrade <key>        ║"
-  echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
-  echo ""
-}
-
-# ================================================================
-# clone_app  —  从已部署的应用复制出一个新实例
-#   $1  源 key（如 wordpress）
-#   $2  新 key（如 wordpress2）
-#   $3  新端口（如 8084）
-# ================================================================
-clone_app() {
-  local SRC_KEY="${1:-}"
-  local DST_KEY="${2:-}"
-  local NEW_PORT="${3:-}"
-
-  # ── 参数校验 ──────────────────────────────────────────────────
-  [[ -z "$SRC_KEY" || -z "$DST_KEY" || -z "$NEW_PORT" ]] && \
-    error "用法: $0 clone <源key> <新key> <新端口>\n       例如: $0 clone wordpress wordpress2 8084"
-
-  local SRC_DIR="$BASE_DIR/$SRC_KEY"
-  local DST_DIR="$BASE_DIR/$DST_KEY"
-
-  already_deployed "$SRC_KEY" || error "源应用 [$SRC_KEY] 尚未部署，请先部署后再克隆"
-  [[ -d "$DST_DIR" ]] && error "目标目录 $DST_DIR 已存在，请换一个新 key 或手动删除"
-
-  # 检查端口是否已被占用（ss 或 netstat）
-  if ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT} " || \
-     grep -r "127.0.0.1:${NEW_PORT}:" "$BASE_DIR"/*/docker-compose.yml 2>/dev/null | grep -q .; then
-    error "端口 $NEW_PORT 已被占用，请换一个端口"
-  fi
-
-  header "克隆 $SRC_KEY → $DST_KEY (端口 $NEW_PORT)"
-
-  # ── 复制目录（排除运行时数据，只复制配置）──────────────────
-  info "复制配置文件..."
-  cp -r "$SRC_DIR" "$DST_DIR"
-
-  # 删掉源实例的运行时数据（数据库、应用数据），新实例应全新初始化
-  # 保留: docker-compose.yml / conf/ / nginx.conf 等配置文件
-  for runtime_dir in db data redis config apps; do
-    [[ -d "$DST_DIR/$runtime_dir" ]] && rm -rf "${DST_DIR:?}/$runtime_dir" && mkdir -p "$DST_DIR/$runtime_dir"
-  done
-
-  # ── 替换端口 ──────────────────────────────────────────────────
-  # 找出源目录 compose 里绑定的宿主机端口（取第一个 127.0.0.1:XXXX）
-  local OLD_PORT
-  OLD_PORT=$(grep -oP '127\.0\.0\.1:\K[0-9]+(?=:)' "$DST_DIR/docker-compose.yml" | head -1)
-
-  if [[ -n "$OLD_PORT" ]]; then
-    sed -i "s/127\.0\.0\.1:${OLD_PORT}:/127.0.0.1:${NEW_PORT}:/g" "$DST_DIR/docker-compose.yml"
-    info "端口: $OLD_PORT → $NEW_PORT"
-  else
-    warn "未能自动替换端口，请手动检查 $DST_DIR/docker-compose.yml"
-  fi
-
-  # ── 替换 Docker 网络名（避免与源实例冲突）──────────────────
-  # 将所有形如 xxx_net 的网络名加上 _<DST_KEY> 后缀
-  sed -i -E "s/([a-z]+_net)\b/\1_${DST_KEY}/g" "$DST_DIR/docker-compose.yml"
-  info "网络名已隔离（加后缀 _${DST_KEY}）"
-
-  # ── 重新生成 .env 密码（避免两个实例共用相同密码）─────────
-  if [[ -f "$DST_DIR/.env" ]]; then
-    info "重新生成 .env 密码..."
-    local tmp_env="$DST_DIR/.env.new"
-    # 对所有含 PASSWORD / SECRET / TOKEN 的行重新生成随机值
-    while IFS= read -r line; do
-      if echo "$line" | grep -qiE '(PASSWORD|SECRET|TOKEN)=.+'; then
-        local key_name val_prefix
-        key_name=$(echo "$line" | cut -d= -f1)
-        echo "${key_name}=$(randpw 24)"
-      else
-        echo "$line"
-      fi
-    done < "$DST_DIR/.env" > "$tmp_env"
-    mv "$tmp_env" "$DST_DIR/.env"
-    info "新凭据已保存至 $DST_DIR/.env"
-  fi
-
-  # ── 启动新实例 ────────────────────────────────────────────────
-  ( cd "$DST_DIR" && docker compose up -d )
-
-  echo ""
-  log "克隆完成！"
-  log "新实例目录: $DST_DIR"
-  log "访问地址:   http://127.0.0.1:$NEW_PORT"
-  log "凭据文件:   $DST_DIR/.env"
-  info "提示：此实例数据库全新初始化，与源实例 [$SRC_KEY] 数据完全隔离"
-}
-
-# ================================================================
-# 交互式菜单
-# ================================================================
-interactive_menu() {
-  while true; do
     echo ""
-    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
-    echo -e "║                🐳  Docker 应用管理脚本                      ║"
-    echo -e "╠══════════════════════════════════════════════════════════════╣"
-    echo -e "║  1) 安装 / 更新 Docker + Compose                            ║"
-    echo -e "║  2) 部署应用（选择）                                        ║"
-    echo -e "║  3) 部署全部应用                                            ║"
-    echo -e "║  4) 升级应用（选择）                                        ║"
-    echo -e "║  5) 升级全部已部署应用                                      ║"
-    echo -e "║  6) 查看运行状态                                            ║"
-    echo -e "║  7) 克隆应用（同一应用部署多实例）                          ║"
-    echo -e "║  0) 退出                                                    ║"
-    echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo -n "  请选择 [0-7]: "
-    read -r choice
-
-    case $choice in
-      1) install_docker ;;
-
-      2)
-        echo ""
-        echo -e "${BOLD}可用应用列表：${NC}"
-        local i=1
-        for entry in "${APP_LIST[@]}"; do
-          local key name port desc deployed_flag=""
-          key=$(app_key "$entry"); name=$(app_name "$entry")
-          port=$(app_port "$entry"); desc=$(app_desc "$entry")
-          already_deployed "$key" && deployed_flag="${GREEN}[已部署]${NC}" || deployed_flag="${DIM}[未部署]${NC}"
-          printf "  %2d) %-18s :%-6s  %s  %b\n" $i "$name" "$port" "$desc" "$deployed_flag"
-          ((i++))
-        done
-        echo -n "  请输入编号（多个用空格分隔，如 1 3 5）: "
-        read -r -a selections
-        for sel in "${selections[@]}"; do
-          if [[ $sel =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#APP_LIST[@]} )); then
-            local entry="${APP_LIST[$((sel-1))]}"
-            do_deploy "$(app_key "$entry")"
-          else
-            warn "无效编号: $sel"
-          fi
-        done
-        print_summary
-        ;;
-
-      3)
-        for entry in "${APP_LIST[@]}"; do
-          do_deploy "$(app_key "$entry")"
-        done
-        print_summary
-        ;;
-
-      4)
-        echo ""
-        echo -e "${BOLD}已部署应用：${NC}"
-        local i=1
-        declare -a deployed_keys=()
-        for entry in "${APP_LIST[@]}"; do
-          local key name port
-          key=$(app_key "$entry"); name=$(app_name "$entry"); port=$(app_port "$entry")
-          if already_deployed "$key"; then
-            printf "  %2d) %-18s :%-6s\n" $i "$name" "$port"
-            deployed_keys+=("$key")
-            ((i++))
-          fi
-        done
-        if [[ ${#deployed_keys[@]} -eq 0 ]]; then
-          warn "暂无已部署的应用"
-        else
-          echo -n "  请输入编号（多个用空格分隔）: "
-          read -r -a selections
-          for sel in "${selections[@]}"; do
-            if [[ $sel =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#deployed_keys[@]} )); then
-              upgrade_app "${deployed_keys[$((sel-1))]}"
-            else
-              warn "无效编号: $sel"
-            fi
-          done
-        fi
-        ;;
-
-      5) upgrade_all ;;
-
-      6) show_status ;;
-
-      7)
-        echo ""
-        echo -e "${BOLD}已部署应用（可作为克隆源）：${NC}"
-        local i=1
-        declare -a deployed_keys=()
-        for entry in "${APP_LIST[@]}"; do
-          local key name port
-          key=$(app_key "$entry"); name=$(app_name "$entry"); port=$(app_port "$entry")
-          if already_deployed "$key"; then
-            printf "  %2d) %-18s :%-6s\n" $i "$name" "$port"
-            deployed_keys+=("$key")
-            ((i++))
-          fi
-        done
-        if [[ ${#deployed_keys[@]} -eq 0 ]]; then
-          warn "暂无已部署的应用"
-        else
-          echo -n "  选择源应用编号: "
-          read -r sel
-          if [[ $sel =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#deployed_keys[@]} )); then
-            local src_key="${deployed_keys[$((sel-1))]}"
-            echo -n "  新实例名称（如 ${src_key}2）: "
-            read -r dst_key
-            echo -n "  新实例端口（如 8090）: "
-            read -r new_port
-            clone_app "$src_key" "$dst_key" "$new_port"
-          else
-            warn "无效编号"
-          fi
-        fi
-        ;;
-
-      0) echo "退出"; exit 0 ;;
-
-      *) warn "无效选项，请重新输入" ;;
-    esac
-  done
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗"
+    echo -e "║              🐳  部署完成 — 端口汇总                    ║"
+    echo -e "╠══════════════════════════════════════════════════════════╣"
+    echo -e "║  WordPress      → http://127.0.0.1:8080                ║"
+    echo -e "║  Nextcloud      → http://127.0.0.1:8081                ║"
+    echo -e "║  Gitea          → http://127.0.0.1:3000                ║"
+    echo -e "║  Uptime Kuma   → http://127.0.0.1:3001                ║"
+    echo -e "║  Portainer      → http://127.0.0.1:9000                ║"
+    echo -e "║  phpMyAdmin     → http://127.0.0.1:8082                ║"
+    echo -e "║  Redis Cmd      → http://127.0.0.1:8083                ║"
+    echo -e "║  MinIO Console  → http://127.0.0.1:9001                ║"
+    echo -e "║  Lsky Pro       → http://127.0.0.1:8085                ║"
+    echo -e "║  EasyImage      → http://127.0.0.1:8086                ║"
+    echo -e "║  Nginx PM       → http://127.0.0.1:81                  ║"
+    echo -e "║  Vaultwarden    → http://127.0.0.1:8087                ║"
+    echo -e "║  N8N            → http://127.0.0.1:5678                ║"
+    echo -e "╠══════════════════════════════════════════════════════════╣"
+    echo -e "║  凭据文件位置: /opt/docker-apps/<app>/.env              ║"
+    echo -e "║  在外部 nginx 将以上端口逐一反代即可对外提供服务        ║"
+    echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 }
 
-# ================================================================
-# 命令行入口
-# ================================================================
-CMD="${1:-menu}"
-case "$CMD" in
-  deploy)
-    KEY="${2:-}"
-    [[ -z "$KEY" ]] && error "用法: $0 deploy <key|all>"
-    if [[ "$KEY" == "all" ]]; then
-      install_docker
-      for entry in "${APP_LIST[@]}"; do do_deploy "$(app_key "$entry")"; done
-      print_summary
-    else
-      do_deploy "$KEY"
+# ============================================================
+# 主流程
+# ============================================================
+main() {
+    # 参数解析
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            --install)
+                check_system
+                install_docker
+                exit 0
+                ;;
+            --deploy)
+                [ -z "${2:-}" ] && error "请指定应用名称，使用 --list 查看可用应用"
+                check_system
+                install_docker
+                case "$2" in
+                    wordpress) deploy_wordpress ;;
+                    nextcloud) deploy_nextcloud ;;
+                    gitea) deploy_gitea ;;
+                    uptime-kuma) deploy_uptime_kuma ;;
+                    portainer) deploy_portainer ;;
+                    phpmyadmin) deploy_phpmyadmin ;;
+                    redis-commander) deploy_redis_commander ;;
+                    minio) deploy_minio ;;
+                    lskypro) deploy_lskypro ;;
+                    easyimage) deploy_easyimage ;;
+                    nginxpm) deploy_nginxpm ;;
+                    vaultwarden) deploy_vaultwarden ;;
+                    n8n) deploy_n8n ;;
+                    *) error "未知应用: $2，使用 --list 查看可用应用" ;;
+                esac
+                exit 0
+                ;;
+            --uninstall)
+                [ -z "${2:-}" ] && error "请指定应用名称"
+                uninstall_app "$2"
+                exit 0
+                ;;
+            --backup)
+                [ -z "${2:-}" ] && error "请指定应用名称"
+                backup_app "$2"
+                exit 0
+                ;;
+            --list)
+                list_apps
+                ;;
+            --help|-h)
+                usage
+                ;;
+            *)
+                error "未知选项: $1，使用 --help 查看帮助"
+                ;;
+        esac
     fi
-    ;;
-  upgrade)
-    KEY="${2:-}"
-    [[ -z "$KEY" ]] && error "用法: $0 upgrade <key|all>"
-    [[ "$KEY" == "all" ]] && upgrade_all || upgrade_app "$KEY"
-    ;;
-  status)
-    show_status
-    ;;
-  clone)
-    clone_app "${2:-}" "${3:-}" "${4:-}"
-    ;;
-  menu|*)
-    interactive_menu
-    ;;
-esac
+
+    # 默认：完整安装
+    check_system
+    install_docker
+
+    # 核心应用
+    deploy_wordpress
+    deploy_nextcloud
+    deploy_gitea
+    deploy_uptime_kuma
+    deploy_portainer
+    deploy_phpmyadmin
+    deploy_redis_commander
+
+    # 图床相关
+    deploy_minio
+    deploy_lskypro
+    deploy_easyimage
+
+    # 工具类
+    deploy_nginxpm
+    deploy_vaultwarden
+    deploy_n8n
+
+    print_summary
+}
+
+main "$@"
