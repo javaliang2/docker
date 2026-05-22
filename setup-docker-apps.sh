@@ -683,6 +683,7 @@ YAML
 # 13. Lsky Pro（兰空图床，使用 MariaDB）
 # ============================================================
 deploy_lskypro() {
+deploy_lskypro() {
     header "部署 Lsky Pro 图床"
     local DIR="$BASE_DIR/lskypro"
     mkdir -p "$DIR"/{data,config,db}
@@ -696,22 +697,6 @@ EOF
 
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
-  lskypro:
-    image: daryl11/lsky-pro:latest
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
-    volumes:
-      - ./data:/var/www/html
-      - ./config:/var/www/html/config
-    ports:
-      - "127.0.0.1:8085:80"
-    depends_on:
-      lskypro-db:
-        condition: service_healthy
-    networks: [lskypro_net]
-
   lskypro-db:
     image: mariadb:11
     restart: unless-stopped
@@ -729,6 +714,30 @@ services:
       timeout: 5s
       retries: 5
 
+  lskypro:
+    image: lskypro/lsky-pro:latest
+    restart: unless-stopped
+    environment:
+      # 数据库连接
+      DB_CONNECTION: mysql
+      DB_HOST: lskypro-db
+      DB_PORT: 3306
+      DB_DATABASE: lskypro
+      DB_USERNAME: lskypro
+      DB_PASSWORD: ${MARIADB_PASSWORD}
+      # 管理员初始账号（可选）
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: $(randpw 16)
+    volumes:
+      - ./data:/var/www/html/storage/app
+      - ./config:/var/www/html/config
+    ports:
+      - "127.0.0.1:8085:80"
+    depends_on:
+      lskypro-db:
+        condition: service_healthy
+    networks: [lskypro_net]
+
 networks:
   lskypro_net:
     driver: bridge
@@ -736,7 +745,8 @@ YAML
 
     run_compose "$DIR" "Lsky Pro"
     log "Lsky Pro 已启动 → http://127.0.0.1:8085"
-    log "数据库: lskypro / lskypro / $DB_PW"
+    log "管理员邮箱: admin@example.com"
+    log "管理员密码: $(grep ADMIN_PASSWORD "$DIR/docker-compose.yml" | head -1 | awk -F': ' '{print $2}')"
 }
 
 # ============================================================
@@ -925,7 +935,7 @@ main() {
                 exit 0
                 ;;
             --deploy)
-                [ -z "${2:-}" ] && error "请指定应用名称，使用 --list 查看可用应用"
+                [ -z "${2:-}" ] && error "请指定应用名称"
                 check_system
                 install_docker
                 case "$2" in
@@ -942,7 +952,7 @@ main() {
                     nginxpm) deploy_nginxpm ;;
                     vaultwarden) deploy_vaultwarden ;;
                     n8n) deploy_n8n ;;
-                    *) error "未知应用: $2，使用 --list 查看可用应用" ;;
+                    *) error "未知应用: $2" ;;
                 esac
                 exit 0
                 ;;
@@ -959,38 +969,38 @@ main() {
             --list)
                 list_apps
                 ;;
+            --all)
+                check_system
+                install_docker
+                deploy_wordpress
+                deploy_nextcloud
+                deploy_gitea
+                deploy_uptime_kuma
+                deploy_portainer
+                deploy_phpmyadmin
+                deploy_redis_commander
+                deploy_minio
+                deploy_lskypro
+                deploy_easyimage
+                deploy_nginxpm
+                deploy_vaultwarden
+                deploy_n8n
+                print_summary
+                exit 0
+                ;;
             --help|-h)
                 usage
                 ;;
             *)
-                error "未知选项: $1，使用 --help 查看帮助"
+                error "未知选项: $1"
                 ;;
         esac
     fi
 
+    # 默认行为：仅安装 Docker
     check_system
     install_docker
-
-    # 核心应用
-    deploy_wordpress
-    deploy_nextcloud
-    deploy_gitea
-    deploy_uptime_kuma
-    deploy_portainer
-    deploy_phpmyadmin
-    deploy_redis_commander
-
-    # 图床相关
-    deploy_minio
-    deploy_lskypro
-    deploy_easyimage
-
-    # 工具类
-    deploy_nginxpm
-    deploy_vaultwarden
-    deploy_n8n
-
-    print_summary
+    log "Docker 安装完成。使用 --deploy <应用名> 部署应用，或 --all 部署全部。"
 }
 
 main "$@"
