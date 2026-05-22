@@ -1,0 +1,145 @@
+# ============================================================
+#  外部 Nginx 反代配置参考
+#  将以下各 server 块加入你的 nginx 网关配置
+#  请将 your-domain.com 替换为实际域名
+#  建议在网关处统一配置 SSL/TLS
+# ============================================================
+
+# ── 通用代理参数（建议 include 引入）───────────────────────
+# /etc/nginx/snippets/proxy-params.conf
+# proxy_http_version 1.1;
+# proxy_set_header Host              $host;
+# proxy_set_header X-Real-IP         $remote_addr;
+# proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+# proxy_set_header X-Forwarded-Proto $scheme;
+# proxy_set_header Upgrade           $http_upgrade;
+# proxy_set_header Connection        "upgrade";
+# proxy_read_timeout 600;
+# proxy_connect_timeout 600;
+# proxy_send_timeout 600;
+# client_max_body_size 2048M;
+
+# ── WordPress ─────────────────────────────────────────────
+server {
+    listen 80;
+    server_name wordpress.your-domain.com;
+
+    client_max_body_size 2048M;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600;
+    }
+}
+
+# ── Nextcloud ──────────────────────────────────────────────
+server {
+    listen 80;
+    server_name nextcloud.your-domain.com;
+
+    client_max_body_size 2048M;
+
+    # Nextcloud 要求的重写
+    add_header Strict-Transport-Security "max-age=15768000; includeSubDomains; preload" always;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600;
+    }
+}
+
+# ── Gitea ──────────────────────────────────────────────────
+server {
+    listen 80;
+    server_name git.your-domain.com;
+
+    client_max_body_size 2048M;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
+
+# ── Uptime Kuma ────────────────────────────────────────────
+server {
+    listen 80;
+    server_name status.your-domain.com;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";  # WebSocket 支持
+    }
+}
+
+# ── Portainer ──────────────────────────────────────────────
+server {
+    listen 80;
+    server_name portainer.your-domain.com;
+
+    location / {
+        proxy_pass         http://127.0.0.1:9000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";  # WebSocket 支持
+    }
+}
+
+# ── phpMyAdmin ─────────────────────────────────────────────
+server {
+    listen 80;
+    server_name pma.your-domain.com;
+
+    client_max_body_size 2048M;
+
+    # 建议加 IP 白名单或 Basic Auth 保护
+    # allow  1.2.3.4;
+    # deny   all;
+    # auth_basic "Restricted";
+    # auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8082;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_read_timeout 600;
+    }
+}
+
+# ── Redis Commander ────────────────────────────────────────
+server {
+    listen 80;
+    server_name redis.your-domain.com;
+
+    # 强烈建议加访问限制
+    # allow  1.2.3.4;
+    # deny   all;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8083;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+    }
+}
