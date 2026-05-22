@@ -2,8 +2,8 @@
 # ============================================================
 #  Docker + Docker Compose 安装 & 热门应用一键部署脚本
 #  支持：WordPress / Nextcloud / Gitea / Uptime Kuma /
-#        Portainer / phpMyAdmin / Redis Commander /
-#        MinIO / Lsky Pro / EasyImage / Nginx Proxy Manager /
+#        Portainer / phpMyAdmin / Redis Commander / MinIO /
+#        Lsky Pro / EasyImage / Nginx Proxy Manager /
 #        Vaultwarden / N8N
 #  用法：sudo bash setup-docker-apps.sh [选项]
 # ============================================================
@@ -117,20 +117,16 @@ install_docker() {
         warn "检测到已安装 Docker（版本 $CURRENT），执行更新..."
     fi
 
-    # 检测发行版
     . /etc/os-release
 
-    # 依赖
     apt-get update -qq
     apt-get install -y -qq ca-certificates curl gnupg lsb-release
 
-    # GPG 密钥
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
-    # 源
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
         https://download.docker.com/linux/${ID} $(lsb_release -cs) stable" \
         > /etc/apt/sources.list.d/docker.list
@@ -146,7 +142,6 @@ install_docker() {
     log "Docker        $DOCKER_VER"
     log "Docker Compose $COMPOSE_VER"
 
-    # 防火墙提示
     if command -v ufw &>/dev/null && ufw status | grep -q inactive; then
         warn "检测到 ufw 未启用，建议执行: ufw enable && ufw allow 22/tcp"
     fi
@@ -173,13 +168,10 @@ backup_app() {
     
     header "备份 $app"
     
-    # 先停止服务以确保数据一致性
     (cd "$dir" && docker compose stop) 2>/dev/null || true
     
-    # 备份
     tar -czf "$backup_file" -C "$(dirname "$dir")" "$(basename "$dir")"
     
-    # 重启服务
     (cd "$dir" && docker compose start) 2>/dev/null || true
     
     local size=$(du -h "$backup_file" | cut -f1)
@@ -203,7 +195,6 @@ uninstall_app() {
         (cd "$dir" && docker compose down -v --remove-orphans) || warn "容器停止失败，继续清理..."
     fi
     
-    # 备份凭据文件（如果存在）
     if [ -f "$dir/.env" ]; then
         cp "$dir/.env" "/tmp/${app}_env_backup_$(date +%Y%m%d)" 2>/dev/null || true
         log "凭据已备份到 /tmp/${app}_env_backup_$(date +%Y%m%d)"
@@ -214,7 +205,7 @@ uninstall_app() {
 }
 
 # ============================================================
-# 5. WordPress（含 MariaDB + Redis 缓存）
+# 5. WordPress（含 MariaDB + Redis）
 # ============================================================
 deploy_wordpress() {
     header "部署 WordPress"
@@ -296,7 +287,6 @@ networks:
     driver: bridge
 YAML
 
-    # PHP 上传限制
     cat > "$DIR/uploads/php-uploads.ini" <<'INI'
 upload_max_filesize = 2048M
 post_max_size       = 2048M
@@ -306,7 +296,6 @@ max_input_time      = 600
 max_input_vars      = 10000
 INI
 
-    # nginx → php-fpm 配置
     cat > "$DIR/uploads/nginx-wp.conf" <<'NGINX'
 server {
     listen 80;
@@ -613,7 +602,7 @@ services:
 YAML
 
     run_compose "$DIR" "phpMyAdmin"
-    log "phpMyAdmin 已启动 → http://127.0.0.1:8082  （填入任意 MySQL 主机连接）"
+    log "phpMyAdmin 已启动 → http://127.0.0.1:8082"
 }
 
 # ============================================================
@@ -668,8 +657,8 @@ services:
     volumes:
       - ./data:/data
     ports:
-      - "127.0.0.1:9002:9000"  # API
-      - "127.0.0.1:9001:9001"  # Console
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9001:9001"
     networks: [minio_net]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -691,18 +680,18 @@ YAML
 }
 
 # ============================================================
-# 13. Lsky Pro（兰空图床）
+# 13. Lsky Pro（兰空图床，使用 MariaDB）
 # ============================================================
 deploy_lskypro() {
     header "部署 Lsky Pro 图床"
     local DIR="$BASE_DIR/lskypro"
-    mkdir -p "$DIR"/{data,config,mysql}
+    mkdir -p "$DIR"/{data,config,db}
 
-    local MYSQL_ROOT_PW=$(randpw)
-    local MYSQL_PW=$(randpw)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PW
-MYSQL_PASSWORD=$MYSQL_PW
+MARIADB_ROOT_PASSWORD=$DB_ROOT_PW
+MARIADB_PASSWORD=$DB_PW
 EOF
 
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -719,20 +708,26 @@ services:
     ports:
       - "127.0.0.1:8085:80"
     depends_on:
-      - lskypro-db
+      lskypro-db:
+        condition: service_healthy
     networks: [lskypro_net]
 
   lskypro-db:
-    image: mysql:8.0
+    image: mariadb:11
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: lskypro
-      MYSQL_USER: lskypro
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: lskypro
+      MARIADB_USER: lskypro
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
     volumes:
-      - ./mysql:/var/lib/mysql
+      - ./db:/var/lib/mysql
     networks: [lskypro_net]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 networks:
   lskypro_net:
@@ -741,7 +736,7 @@ YAML
 
     run_compose "$DIR" "Lsky Pro"
     log "Lsky Pro 已启动 → http://127.0.0.1:8085"
-    log "数据库: lskypro / lskypro / $MYSQL_PW"
+    log "数据库: lskypro / lskypro / $DB_PW"
 }
 
 # ============================================================
@@ -775,7 +770,6 @@ YAML
 
     run_compose "$DIR" "EasyImage"
     log "EasyImage 已启动 → http://127.0.0.1:8086"
-    log "支持存储驱动: 本地/S3(MinIO)/FTP/阿里OSS等"
 }
 
 # ============================================================
@@ -923,7 +917,6 @@ print_summary() {
 # 主流程
 # ============================================================
 main() {
-    # 参数解析
     if [[ $# -gt 0 ]]; then
         case "$1" in
             --install)
@@ -975,7 +968,6 @@ main() {
         esac
     fi
 
-    # 默认：完整安装
     check_system
     install_docker
 
