@@ -683,7 +683,6 @@ YAML
 # 13. Lsky Pro（兰空图床，使用 MariaDB）
 # ============================================================
 deploy_lskypro() {
-deploy_lskypro() {
     header "部署 Lsky Pro 图床"
     local DIR="$BASE_DIR/lskypro"
     mkdir -p "$DIR"/{data,config,db}
