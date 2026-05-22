@@ -65,11 +65,7 @@ list_apps() {
         for dir in "$BASE_DIR"/*/; do
             app=$(basename "$dir")
             if [ -f "$dir/docker-compose.yml" ]; then
-                # FIX #6: 避免模板字符串在旧版本报错，改用 --format json + 兜底
-                status=$(cd "$dir" && docker compose ps --format json 2>/dev/null \
-                    | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4 \
-                    || echo "unknown")
-                [ -z "$status" ] && status="stopped"
+                status=$(cd "$dir" && docker compose ps --format '{{.Status}}' 2>/dev/null | head -1 || echo "stopped")
                 echo -e "  ${GREEN}$app${NC} - $status"
             fi
         done
@@ -81,19 +77,16 @@ list_apps() {
 check_system() {
     local mem=$(free -m | awk '/^Mem:/{print $2}')
     local disk=$(df -m /opt | awk 'NR==2{print $4}')
-
+    
     [ "$mem" -lt 1024 ] && warn "内存不足 1GB（当前 ${mem}MB），可能影响性能"
     [ "$disk" -lt 5120 ] && warn "磁盘空间不足 5GB（剩余 ${disk}MB），建议扩展空间"
-
-    # FIX #8: 兼容 Debian 衍生版（raspbian、linuxmint、kali 等）
+    
+    # 检测发行版
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        case "${ID_LIKE:-$ID}" in
-            *ubuntu*|*debian*) return 0 ;;
-        esac
         case "$ID" in
-            ubuntu|debian|raspbian|linuxmint|kali|pop) return 0 ;;
-            *) error "仅支持 Ubuntu/Debian 系系统，当前系统: $ID" ;;
+            ubuntu|debian) return 0 ;;
+            *) error "仅支持 Ubuntu/Debian 系统，当前系统: $ID" ;;
         esac
     else
         error "无法检测系统发行版"
@@ -157,19 +150,8 @@ install_docker() {
 # ============================================================
 # 2. 生成随机密码工具
 # ============================================================
-# FIX #1: 使用 base64 避免特殊字符过滤后长度不足，再截取字母数字
-randpw() {
-    local length="${1:-24}"
-    # 用 base64 保证充足字节，再过滤掉非字母数字字符，取够长度
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length"
-    echo  # 补换行，方便 $() 捕获时不留尾部空白
-}
-
-# 生成含特殊字符的强密码（用于 admin token 等场景）
-randpw_strong() {
-    local length="${1:-32}"
-    tr -dc 'A-Za-z0-9!@#$%^&*_+-' </dev/urandom | head -c "$length"
-    echo
+randpw() { 
+    tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c "${1:-24}" 
 }
 
 # ============================================================
@@ -179,30 +161,20 @@ backup_app() {
     local app="$1"
     local dir="$BASE_DIR/$app"
     local backup_file="/tmp/${app}_$(date +%Y%m%d_%H%M%S).tar.gz"
-
+    
     if [ ! -d "$dir" ]; then
         error "应用 $app 未部署，目录 $dir 不存在"
     fi
-
+    
     header "备份 $app"
-
-    # FIX #5: 用 trap 保证无论 tar 成功或失败，容器都会重新启动
+    
     (cd "$dir" && docker compose stop) 2>/dev/null || true
-
-    _backup_restart() {
-        (cd "$dir" && docker compose start) 2>/dev/null || \
-            warn "$app 容器重启失败，请手动执行: docker compose -f $dir/docker-compose.yml start"
-    }
-    trap _backup_restart EXIT
-
+    
     tar -czf "$backup_file" -C "$(dirname "$dir")" "$(basename "$dir")"
-
-    # tar 成功后取消 trap，由下面的正常流程重启
-    trap - EXIT
-    _backup_restart
-
-    local size
-    size=$(du -h "$backup_file" | cut -f1)
+    
+    (cd "$dir" && docker compose start) 2>/dev/null || true
+    
+    local size=$(du -h "$backup_file" | cut -f1)
     log "已备份 $app 到 $backup_file (大小: $size)"
 }
 
@@ -212,22 +184,22 @@ backup_app() {
 uninstall_app() {
     local app="$1"
     local dir="$BASE_DIR/$app"
-
+    
     if [ ! -d "$dir" ]; then
         error "应用 $app 未部署，目录 $dir 不存在"
     fi
-
+    
     header "卸载 $app"
-
+    
     if [ -f "$dir/docker-compose.yml" ]; then
         (cd "$dir" && docker compose down -v --remove-orphans) || warn "容器停止失败，继续清理..."
     fi
-
+    
     if [ -f "$dir/.env" ]; then
         cp "$dir/.env" "/tmp/${app}_env_backup_$(date +%Y%m%d)" 2>/dev/null || true
         log "凭据已备份到 /tmp/${app}_env_backup_$(date +%Y%m%d)"
     fi
-
+    
     rm -rf "$dir"
     log "已卸载 $app 并删除所有数据"
 }
@@ -240,8 +212,8 @@ deploy_wordpress() {
     local DIR="$BASE_DIR/wordpress"
     mkdir -p "$DIR"/{data,db,redis,uploads}
 
-    local DB_ROOT_PW; DB_ROOT_PW=$(randpw)
-    local DB_PW; DB_PW=$(randpw)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
 
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_ROOT_PASSWORD=$DB_ROOT_PW
@@ -361,9 +333,9 @@ deploy_nextcloud() {
     local DIR="$BASE_DIR/nextcloud"
     mkdir -p "$DIR"/{data,db,redis,config,apps}
 
-    local DB_ROOT_PW; DB_ROOT_PW=$(randpw)
-    local DB_PW; DB_PW=$(randpw)
-    local ADMIN_PW; ADMIN_PW=$(randpw 20)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
+    local ADMIN_PW=$(randpw 20)
 
     cat > "$DIR/.env" <<EOF
 MYSQL_ROOT_PASSWORD=$DB_ROOT_PW
@@ -371,7 +343,6 @@ MYSQL_PASSWORD=$DB_PW
 NEXTCLOUD_ADMIN_PASSWORD=$ADMIN_PW
 EOF
 
-    # FIX #7: nginx 容器补充挂载 nextcloud 应用根目录（静态资源服务需要）
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   db:
@@ -413,7 +384,6 @@ services:
       PHP_UPLOAD_LIMIT: 2048M
       PHP_MEMORY_LIMIT: 1024M
     volumes:
-      - nextcloud_root:/var/www/html
       - ./data:/var/www/html/data
       - ./config:/var/www/html/config
       - ./apps:/var/www/html/custom_apps
@@ -424,8 +394,6 @@ services:
     restart: unless-stopped
     depends_on: [nextcloud]
     volumes:
-      # FIX #7: 挂载应用根目录，确保 nginx 能直接服务静态资源（CSS/JS/图片等）
-      - nextcloud_root:/var/www/html:ro
       - ./data:/var/www/html/data:ro
       - ./config:/var/www/html/config:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
@@ -438,16 +406,10 @@ services:
     restart: unless-stopped
     depends_on: [nextcloud]
     volumes:
-      - nextcloud_root:/var/www/html
       - ./data:/var/www/html/data
       - ./config:/var/www/html/config
     entrypoint: /cron.sh
     networks: [nc_net]
-
-volumes:
-  # 命名卷：nextcloud 容器写入的应用文件（核心代码、插件等）
-  # nginx 和 cron 通过共享此卷访问，保证三者看到同一份文件
-  nextcloud_root:
 
 networks:
   nc_net:
@@ -509,7 +471,7 @@ deploy_gitea() {
     local DIR="$BASE_DIR/gitea"
     mkdir -p "$DIR"/{data,db}
 
-    local DB_PW; DB_PW=$(randpw)
+    local DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
 POSTGRES_PASSWORD=$DB_PW
 EOF
@@ -599,10 +561,6 @@ deploy_portainer() {
     local DIR="$BASE_DIR/portainer"
     mkdir -p "$DIR/data"
 
-    # FIX #4: 明确告知用户挂载 docker.sock 的权限含义
-    warn "Portainer 需要挂载 /var/run/docker.sock，该操作赋予容器等同于 root 的 Docker 控制权限。"
-    warn "请确保 Portainer 访问入口不对公网直接暴露。"
-
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   portainer:
@@ -681,7 +639,7 @@ deploy_minio() {
     mkdir -p "$DIR/data"
 
     local ACCESS_KEY="admin"
-    local SECRET_KEY; SECRET_KEY=$(randpw 32)
+    local SECRET_KEY=$(randpw 32)
     cat > "$DIR/.env" <<EOF
 MINIO_ROOT_USER=$ACCESS_KEY
 MINIO_ROOT_PASSWORD=$SECRET_KEY
@@ -729,8 +687,8 @@ deploy_lskypro() {
     local DIR="$BASE_DIR/lskypro"
     mkdir -p "$DIR"/{data,config,db}
 
-    local DB_ROOT_PW; DB_ROOT_PW=$(randpw)
-    local DB_PW; DB_PW=$(randpw)
+    local DB_ROOT_PW=$(randpw)
+    local DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
 MARIADB_ROOT_PASSWORD=$DB_ROOT_PW
 MARIADB_PASSWORD=$DB_PW
@@ -822,10 +780,6 @@ deploy_nginxpm() {
     local DIR="$BASE_DIR/nginx-proxy-manager"
     mkdir -p "$DIR"/{data,letsencrypt}
 
-    # FIX #3: 明确告知 80/443 会绑定到所有网卡（对外暴露）
-    warn "Nginx Proxy Manager 将监听 0.0.0.0:80 和 0.0.0.0:443（公网可达）。"
-    warn "这是反代网关的预期行为，请在部署后立即修改默认管理员密码（admin@example.com / changeme）。"
-
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   nginx-proxy-manager:
@@ -835,10 +789,8 @@ services:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     ports:
-      # 以下两个端口会绑定到所有网卡（公网可达），这是反代网关的预期行为
       - "80:80"
       - "443:443"
-      # 管理界面仅绑定本地，需通过 SSH 隧道或反代访问
       - "127.0.0.1:81:81"
     networks: [npm_net]
 
@@ -850,7 +802,7 @@ YAML
     run_compose "$DIR" "Nginx Proxy Manager"
     log "Nginx Proxy Manager 已启动"
     log "管理界面 → http://127.0.0.1:81"
-    log "默认账号: admin@example.com / changeme  ← 请立即修改！"
+    log "默认账号: admin@example.com / changeme"
 }
 
 # ============================================================
@@ -861,37 +813,10 @@ deploy_vaultwarden() {
     local DIR="$BASE_DIR/vaultwarden"
     mkdir -p "$DIR/data"
 
-    # FIX #2: Admin Token 使用 argon2 哈希存储
-    # 先生成原始 token，再用 vaultwarden 自身工具生成哈希
-    local RAW_TOKEN; RAW_TOKEN=$(randpw_strong 48)
-
-    # 尝试用 vaultwarden 容器生成 argon2 哈希（需要 docker 已就绪）
-    local HASHED_TOKEN
-    HASHED_TOKEN=$(docker run --rm vaultwarden/server:latest \
-        /vaultwarden hash --preset owasp 2>/dev/null <<< "$RAW_TOKEN" \
-        | grep -oP '(?<=Hash: ).*' || true)
-
-    if [ -z "$HASHED_TOKEN" ]; then
-        warn "无法生成 argon2 哈希（可能镜像尚未拉取），将使用明文 token。"
-        warn "建议在服务启动后手动执行:"
-        warn "  docker run --rm vaultwarden/server:latest /vaultwarden hash --preset owasp"
-        warn "  然后将输出的 Hash 替换 $DIR/.env 中的 ADMIN_TOKEN，并重启容器。"
-        HASHED_TOKEN="$RAW_TOKEN"
-    else
-        log "Admin Token 已使用 argon2 哈希存储"
-    fi
-
+    local ADMIN_TOKEN=$(randpw 48)
     cat > "$DIR/.env" <<EOF
-# 登录管理面板时使用下方「原始 Token」，.env 中存储的是其 argon2 哈希
-# 原始 Token（请妥善保管，勿提交到版本库）:
-# ADMIN_TOKEN_RAW=$RAW_TOKEN
-ADMIN_TOKEN=$HASHED_TOKEN
+ADMIN_TOKEN=$ADMIN_TOKEN
 EOF
-
-    # 同时将原始 token 单独存一份，权限收窄
-    echo "$RAW_TOKEN" > "$DIR/.admin_token_raw"
-    chmod 600 "$DIR/.admin_token_raw"
-    log "原始 Admin Token 已单独保存至 $DIR/.admin_token_raw（权限 600）"
 
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
@@ -916,7 +841,7 @@ YAML
     run_compose "$DIR" "Vaultwarden"
     log "Vaultwarden 已启动 → http://127.0.0.1:8087"
     log "管理面板: http://127.0.0.1:8087/admin"
-    log "登录用原始 Token（见 $DIR/.admin_token_raw）"
+    log "Admin Token: $ADMIN_TOKEN"
 }
 
 # ============================================================
@@ -927,7 +852,7 @@ deploy_n8n() {
     local DIR="$BASE_DIR/n8n"
     mkdir -p "$DIR/data"
 
-    local ENCRYPTION_KEY; ENCRYPTION_KEY=$(randpw 32)
+    local ENCRYPTION_KEY=$(randpw 32)
     cat > "$DIR/.env" <<EOF
 N8N_ENCRYPTION_KEY=$ENCRYPTION_KEY
 EOF
