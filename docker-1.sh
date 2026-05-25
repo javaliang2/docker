@@ -791,7 +791,7 @@ install_docker() {
 randpw() {
     local len="${1:-24}"
     # 用 dd 精确读取字节数，避免 head -c 关闭管道时 tr 收到 SIGPIPE 触发 pipefail
-    tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom 2>/dev/null \
+    tr -dc 'A-Za-z0-9!@#%^&*()_+-=' </dev/urandom 2>/dev/null \
         | dd bs=1 count="$len" 2>/dev/null
     echo
 }
